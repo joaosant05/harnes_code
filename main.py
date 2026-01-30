@@ -1,7 +1,6 @@
 import re
 import pandas as pd
 
-# ===== Diálogos de arquivo (tkinter) =====
 try:
     import tkinter as tk
     from tkinter import filedialog
@@ -35,107 +34,141 @@ def output_path(name="Processed_file.xlsx"):
     root.destroy()
     return caminho
 
-# ===== Variaveis =====
-ABA = "SOP - Final"
+def make_unique_columns(cols):
+    counts = {}
+    out = []
+    for c in cols:
+        c = "" if c is None else str(c).strip()
+        if c not in counts:
+            counts[c] = 1
+            out.append(c)
+        else:
+            counts[c] += 1
+            out.append(f"{c}__{counts[c]}")
+    return out
 
-NOME_COL_WHI = "Wiring Harness Identifier (W)"
-NOME_COL_HARNESS = "Harness (PN)"
-NOME_COL_VARIANT = "Variant"
+def read_sheet_with_dynamic_header(path, sheet_name, required_cols, max_scan_rows=80, dtype=str):
+    print(f"[1/6] Lendo aba '{sheet_name}' (header dinâmico)...")
+    raw = pd.read_excel(path, sheet_name=sheet_name, header=None, dtype=dtype)
+
+    def norm(x):
+        if x is None:
+            return ""
+        s = str(x)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    required_norm = [norm(c) for c in required_cols]
+
+    header_row = None
+    scan = min(max_scan_rows, len(raw))
+    for i in range(scan):
+        row_vals = [norm(v) for v in raw.iloc[i].tolist()]
+        row_set = set(row_vals)
+        if all(c in row_set for c in required_norm):
+            header_row = i
+            break
+
+    if header_row is None:
+        raise ValueError(
+            f"Não encontrei o cabeçalho nas primeiras {max_scan_rows} linhas da aba '{sheet_name}'. "
+            f"Precisava conter as colunas: {required_cols}"
+        )
+
+    headers = [norm(v) for v in raw.iloc[header_row].tolist()]
+    headers = make_unique_columns(headers)
+
+    df = raw.iloc[header_row + 1:].copy()
+    df.columns = headers
+    df.reset_index(drop=True, inplace=True)
+    print(f"[2/6] Header encontrado na linha {header_row+1}. Linhas: {len(df):,} | Colunas: {len(df.columns)}")
+    return df, header_row
+
+def is_filled_series(s: pd.Series) -> pd.Series:
+    s = s.astype(str).fillna("").str.strip()
+    return (s != "") & (s.str.lower() != "nan")
 
 ARQ_ENTRADA = select_file()
-ARQ_SAIDA = output_path()
+if not ARQ_ENTRADA:
+    raise SystemExit("Nenhum arquivo selecionado.")
 
-# ======= Leitura de TODAS as abas (pra preservar estrutura/valores) =======
 xls = pd.ExcelFile(ARQ_ENTRADA)
+print("\nAbas disponíveis:")
+for sh in xls.sheet_names:
+    print(f" - {sh}")
+
+ABA = input("\nInforme o nome da planilha que deseja analisar: ").strip()
+if ABA not in xls.sheet_names:
+    raise ValueError(f"A aba '{ABA}' não existe no arquivo.")
+
+HARNESS_COL = input("Informe o nome da coluna de chicotes (HARNESS): ").strip()
+
+NOME_COL_WHI = "Wiring Harness Identifier (W)"
+NOME_COL_MIDDLE = "Logic Connector Identifier"
+NOME_COL_LEFT = "lado esquerdo"
+NOME_COL_RIGHT = "lado direito"
+
+ARQ_SAIDA = output_path()
+if not ARQ_SAIDA:
+    raise SystemExit("Caminho de saída não informado.")
+
+print("\n[0/6] Lendo todas as abas (pode demorar em arquivos grandes)...")
 sheets = {}
 for sh in xls.sheet_names:
+    print(f"  - Lendo aba: {sh}")
     sheets[sh] = pd.read_excel(ARQ_ENTRADA, sheet_name=sh, dtype=str)
 
-df = sheets[ABA].copy()
+required = [HARNESS_COL, NOME_COL_MIDDLE, NOME_COL_RIGHT, NOME_COL_LEFT]
+df, header_row = read_sheet_with_dynamic_header(ARQ_ENTRADA, ABA, required_cols=required, dtype=str)
 
-# ======= Lógica WHI =======
+if HARNESS_COL not in df.columns:
+    raise ValueError(f"Não achei a coluna '{HARNESS_COL}' no cabeçalho. Colunas: {list(df.columns)}")
 
-# Garante que a coluna WHI exista (se já existir, vamos sobrescrever/preencher)
+missing = [c for c in [HARNESS_COL, NOME_COL_MIDDLE, NOME_COL_RIGHT, NOME_COL_LEFT] if c not in df.columns]
+if missing:
+    raise ValueError(f"Colunas não encontradas: {missing}\nColunas disponíveis: {list(df.columns)}")
+
 if NOME_COL_WHI not in df.columns:
     df[NOME_COL_WHI] = ""
 
-# Normaliza vazios
-df[NOME_COL_HARNESS] = df[NOME_COL_HARNESS].fillna("")
-df[NOME_COL_VARIANT] = df[NOME_COL_VARIANT].fillna("")
-df[NOME_COL_WHI] = df[NOME_COL_WHI].fillna("")
+print("[3/6] Preparando códigos (um por código, ordem de cima pra baixo)...")
+harness = df[HARNESS_COL].astype(str).fillna("").str.strip()
+codes_in_order = pd.unique(harness[harness != ""])
+print(f"  - Códigos únicos: {len(codes_in_order)}")
 
-# Harness únicos na ordem que aparecem
-harness_order = pd.unique(df[NOME_COL_HARNESS])
+groups = df.groupby(harness, sort=False).groups
+priority_cols = [NOME_COL_MIDDLE, NOME_COL_RIGHT, NOME_COL_LEFT]
 
-# Funções auxiliares
-v_regex = re.compile(r"^\s*v\s*(\d+)\s*$", re.IGNORECASE)
+print("[4/6] Aplicando regra de prioridade e atribuindo W...")
+w_counter = 1
+processed = 0
+assigned_count = 0
 
-def variant_key(v: str):
-    """
-    Ordena v1..vx por número; 'all' vai por último.
-    Qualquer outra coisa também vai depois (mas mantendo comportamento previsível).
-    """
-    if v is None:
-        return (2, 10**9)
-    vv = v.strip().lower()
-    if vv == "all":
-        return (1, 10**9)
-    m = v_regex.match(vv)
-    if m:
-        return (0, int(m.group(1)))
-    return (2, 10**9)
-
-w_counter = 1  # contador global
-
-for h in harness_order:
-    if h == "":
+for code in codes_in_order:
+    idx = groups.get(code)
+    if idx is None or len(idx) == 0:
         continue
 
-    mask_h = (df[NOME_COL_HARNESS] == h)
-    variants_in_h = pd.unique(df.loc[mask_h, NOME_COL_VARIANT])
+    assigned = False
+    for col in priority_cols:
+        if is_filled_series(df.loc[idx, col]).any():
+            df.loc[idx, NOME_COL_WHI] = f"W{w_counter}"
+            w_counter += 1
+            assigned = True
+            assigned_count += 1
+            break
 
-    # Separa v1..vx e all
-    v_list = []
-    has_all = False
-    for v in variants_in_h:
-        vv = (v or "").strip()
-        if vv.lower() == "all":
-            has_all = True
-        else:
-            # só considera vN como variante numerada
-            if v_regex.match(vv.lower()):
-                v_list.append(vv)
-            else:
-                # se aparecer algo fora do padrão, você pode ignorar ou tratar.
-                # aqui: ignora silenciosamente (sem fallback/validação, conforme seu obs3).
-                pass
+    processed += 1
+    if processed % 200 == 0:
+        print(f"  ...{processed}/{len(codes_in_order)} códigos processados (W atribuídos: {assigned_count})")
 
-    # Ordena v1..vx por número
-    v_list = sorted(set(v_list), key=lambda x: variant_key(x))
+print(f"[5/6] Concluído. Códigos processados: {processed} | W atribuídos: {assigned_count}")
 
-    # Mapa de variantes -> W para este harness
-    whi_parts = []
-
-    # Aplica W1, W2, ... para v1..vx (incremental global)
-    for v in v_list:
-        w_label = f"W{w_counter}"
-        w_counter += 1
-        mask = mask_h & (df[NOME_COL_VARIANT].str.strip().str.lower() == v.strip().lower())
-        df.loc[mask, NOME_COL_WHI] = w_label
-        whi_parts.append(w_label)
-
-    # Aplica ALL como junção W1/W2/...
-    if has_all:
-        joined = "/".join(whi_parts)
-        mask_all = mask_h & (df[NOME_COL_VARIANT].str.strip().str.lower() == "all")
-        df.loc[mask_all, NOME_COL_WHI] = joined
-
-# Atualiza a aba final no dicionário
 sheets[ABA] = df
 
-# ======= Escrita: mesma estrutura/abas (valores) =======
+print("[6/6] Salvando arquivo de saída...")
 with pd.ExcelWriter(ARQ_SAIDA, engine="openpyxl") as writer:
-    for sh_name, sh_df in sheets.items():
-        sh_df.to_excel(writer, sheet_name=sh_name, index=False)
+    for sh, sdf in sheets.items():
+        sdf.to_excel(writer, sheet_name=sh, index=False)
 
-print(f"Arquivo salvo em: {ARQ_SAIDA}")
+print(f"✅ Arquivo gerado em: {ARQ_SAIDA}")
