@@ -48,7 +48,7 @@ def make_unique_columns(cols):
     return out
 
 def read_sheet_with_dynamic_header(path, sheet_name, required_cols, max_scan_rows=80, dtype=str):
-    print(f"[1/6] Lendo aba '{sheet_name}' (header dinâmico)...")
+    print(f"[1/7] Lendo aba '{sheet_name}' (header dinâmico)...")
     raw = pd.read_excel(path, sheet_name=sheet_name, header=None, dtype=dtype)
 
     def norm(x):
@@ -81,7 +81,8 @@ def read_sheet_with_dynamic_header(path, sheet_name, required_cols, max_scan_row
     df = raw.iloc[header_row + 1:].copy()
     df.columns = headers
     df.reset_index(drop=True, inplace=True)
-    print(f"[2/6] Header encontrado na linha {header_row+1}. Linhas: {len(df):,} | Colunas: {len(df.columns)}")
+
+    print(f"[2/7] Header encontrado na linha {header_row+1}. Linhas: {len(df):,} | Colunas: {len(df.columns)}")
     return df, header_row
 
 def is_filled_series(s: pd.Series) -> pd.Series:
@@ -112,17 +113,14 @@ ARQ_SAIDA = output_path()
 if not ARQ_SAIDA:
     raise SystemExit("Caminho de saída não informado.")
 
-print("\n[0/6] Lendo todas as abas (pode demorar em arquivos grandes)...")
+print("\n[0/7] Lendo todas as abas (pode demorar em arquivos grandes)...")
 sheets = {}
 for sh in xls.sheet_names:
     print(f"  - Lendo aba: {sh}")
     sheets[sh] = pd.read_excel(ARQ_ENTRADA, sheet_name=sh, dtype=str)
 
 required = [HARNESS_COL, NOME_COL_MIDDLE, NOME_COL_RIGHT, NOME_COL_LEFT]
-df, header_row = read_sheet_with_dynamic_header(ARQ_ENTRADA, ABA, required_cols=required, dtype=str)
-
-if HARNESS_COL not in df.columns:
-    raise ValueError(f"Não achei a coluna '{HARNESS_COL}' no cabeçalho. Colunas: {list(df.columns)}")
+df, _ = read_sheet_with_dynamic_header(ARQ_ENTRADA, ABA, required_cols=required, dtype=str)
 
 missing = [c for c in [HARNESS_COL, NOME_COL_MIDDLE, NOME_COL_RIGHT, NOME_COL_LEFT] if c not in df.columns]
 if missing:
@@ -131,44 +129,46 @@ if missing:
 if NOME_COL_WHI not in df.columns:
     df[NOME_COL_WHI] = ""
 
-print("[3/6] Preparando códigos (um por código, ordem de cima pra baixo)...")
+print("[3/7] Preparando ordem dos códigos (pela primeira aparição na coluna HARNESS)...")
 harness = df[HARNESS_COL].astype(str).fillna("").str.strip()
 codes_in_order = pd.unique(harness[harness != ""])
-print(f"  - Códigos únicos: {len(codes_in_order)}")
+print(f"  - Códigos únicos em ordem: {len(codes_in_order)}")
 
 groups = df.groupby(harness, sort=False).groups
 priority_cols = [NOME_COL_MIDDLE, NOME_COL_RIGHT, NOME_COL_LEFT]
 
-print("[4/6] Aplicando regra de prioridade e atribuindo W...")
+print("[4/7] Aplicando W na ordem dos códigos; dentro de cada código: MIDDLE -> RIGHT -> LEFT...")
 w_counter = 1
-processed = 0
-assigned_count = 0
+processed_codes = 0
+total_assignments = 0
 
 for code in codes_in_order:
-    idx = groups.get(code)
-    if idx is None or len(idx) == 0:
+    idx_code = groups.get(code)
+    if idx_code is None or len(idx_code) == 0:
         continue
 
-    assigned = False
+    # Para cada código: varre MIDDLE/RIGHT/LEFT e, se existir valor naquele lado,
+    # atribui o próximo W para as linhas daquele lado (não para o código inteiro).
     for col in priority_cols:
-        if is_filled_series(df.loc[idx, col]).any():
-            df.loc[idx, NOME_COL_WHI] = f"W{w_counter}"
+        filled_mask = is_filled_series(df.loc[idx_code, col])
+        if filled_mask.any():
+            idx_apply = idx_code[filled_mask.values]
+            df.loc[idx_apply, NOME_COL_WHI] = f"W{w_counter}"
+            print(f"  {processed_codes+1:>5}/{len(codes_in_order)} | HARNESS={code} | {col} -> W{w_counter} ({len(idx_apply)} linhas)")
             w_counter += 1
-            assigned = True
-            assigned_count += 1
-            break
+            total_assignments += 1
 
-    processed += 1
-    if processed % 200 == 0:
-        print(f"  ...{processed}/{len(codes_in_order)} códigos processados (W atribuídos: {assigned_count})")
+    processed_codes += 1
+    if processed_codes % 200 == 0:
+        print(f"  ...{processed_codes}/{len(codes_in_order)} códigos processados | W gerados: {w_counter-1}")
 
-print(f"[5/6] Concluído. Códigos processados: {processed} | W atribuídos: {assigned_count}")
+print(f"[5/7] Concluído. Códigos processados: {processed_codes} | W gerados: {w_counter-1} | Atribuições (lados encontrados): {total_assignments}")
 
 sheets[ABA] = df
 
-print("[6/6] Salvando arquivo de saída...")
+print("[6/7] Salvando arquivo de saída...")
 with pd.ExcelWriter(ARQ_SAIDA, engine="openpyxl") as writer:
     for sh, sdf in sheets.items():
         sdf.to_excel(writer, sheet_name=sh, index=False)
 
-print(f"✅ Arquivo gerado em: {ARQ_SAIDA}")
+print(f"[7/7] ✅ Arquivo gerado em: {ARQ_SAIDA}")
