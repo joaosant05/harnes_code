@@ -1,5 +1,6 @@
 import re
 import pandas as pd
+from pathlib import Path
 
 try:
     import tkinter as tk
@@ -7,6 +8,7 @@ try:
     TK_OK = True
 except Exception:
     TK_OK = False
+
 
 def select_file():
     if not TK_OK:
@@ -19,6 +21,7 @@ def select_file():
     )
     root.destroy()
     return caminho
+
 
 def output_path(name="Processed_file.xlsx"):
     if not TK_OK:
@@ -34,6 +37,7 @@ def output_path(name="Processed_file.xlsx"):
     root.destroy()
     return caminho
 
+
 def make_unique_columns(cols):
     counts = {}
     out = []
@@ -46,6 +50,7 @@ def make_unique_columns(cols):
             counts[c] += 1
             out.append(f"{c}__{counts[c]}")
     return out
+
 
 def read_sheet_with_dynamic_header(path, sheet_name, required_cols, max_scan_rows=80, dtype=str):
     print(f"[1/7] Lendo aba '{sheet_name}' (header dinâmico)...")
@@ -85,9 +90,28 @@ def read_sheet_with_dynamic_header(path, sheet_name, required_cols, max_scan_row
     print(f"[2/7] Header encontrado na linha {header_row+1}. Linhas: {len(df):,} | Colunas: {len(df.columns)}")
     return df, header_row
 
+
 def is_filled_series(s: pd.Series) -> pd.Series:
     s = s.astype(str).fillna("").str.strip()
     return (s != "") & (s.str.lower() != "nan")
+
+
+def parse_w_number(x: str):
+    """Extrai o número de 'W123'. Retorna int ou None."""
+    if x is None:
+        return None
+    m = re.match(r"^\s*W\s*(\d+)\s*$", str(x), flags=re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+def chunk_list(lst, size=5):
+    for i in range(0, len(lst), size):
+        yield lst[i:i + size]
+
+
+# =========================
+# EXECUÇÃO
+# =========================
 
 ARQ_ENTRADA = select_file()
 if not ARQ_ENTRADA:
@@ -164,11 +188,60 @@ for code in codes_in_order:
 
 print(f"[5/7] Concluído. Códigos processados: {processed_codes} | W gerados: {w_counter-1} | Atribuições (lados encontrados): {total_assignments}")
 
+# Atualiza a aba analisada com a versão processada
 sheets[ABA] = df
 
-print("[6/7] Salvando arquivo de saída...")
-with pd.ExcelWriter(ARQ_SAIDA, engine="openpyxl") as writer:
-    for sh, sdf in sheets.items():
-        sdf.to_excel(writer, sheet_name=sh, index=False)
+# =========================
+# SALVAMENTO FRAGMENTADO
+# =========================
+print("[6/7] Salvando arquivos fragmentados por faixa de W (5 em 5)...")
 
-print(f"[7/7] ✅ Arquivo gerado em: {ARQ_SAIDA}")
+out_base = Path(ARQ_SAIDA)
+out_dir = out_base.parent
+out_stem = out_base.stem  # nome sem .xlsx
+
+w_nums = (
+    df[NOME_COL_WHI]
+    .astype(str).map(parse_w_number)
+    .dropna().astype(int)
+)
+
+if w_nums.empty:
+    # Se não tiver nenhum W gerado, salva 1 arquivo normal
+    out_path = out_dir / f"{out_stem}.xlsx"
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        for sh, sdf in sheets.items():
+            sdf.to_excel(writer, sheet_name=sh, index=False)
+    print(f"[7/7] ✅ Nenhum W encontrado. Arquivo único gerado em: {out_path}")
+else:
+    w_unique_sorted = sorted(w_nums.unique())
+    total_files = 0
+
+    for chunk in chunk_list(w_unique_sorted, size=5):
+        w_start, w_end = chunk[0], chunk[-1]
+        if w_start == w_end:
+            suffix = f"W{w_start}"
+        else:
+            suffix = f"W{w_start}-W{w_end}"
+
+        out_path = out_dir / f"{out_stem}_{suffix}.xlsx"
+
+        # Filtra somente a ABA pelo intervalo de W do chunk
+        chunk_set = set(chunk)
+        whi_nums_all = df[NOME_COL_WHI].astype(str).map(parse_w_number)
+        df_filtered = df[whi_nums_all.isin(chunk_set)].copy()
+
+        # (Opcional) Se quiser manter também linhas sem W no arquivo fragmentado, descomente:
+        # df_filtered = df[whi_nums_all.isin(chunk_set) | whi_nums_all.isna()].copy()
+
+        with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+            for sh, sdf in sheets.items():
+                if sh == ABA:
+                    df_filtered.to_excel(writer, sheet_name=sh, index=False)
+                else:
+                    sdf.to_excel(writer, sheet_name=sh, index=False)
+
+        total_files += 1
+        print(f"  - Gerado: {out_path.name} | Linhas na aba '{ABA}': {len(df_filtered):,}")
+
+    print(f"[7/7] ✅ Concluído. {total_files} arquivo(s) gerado(s) em: {out_dir}")
